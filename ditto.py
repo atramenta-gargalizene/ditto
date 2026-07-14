@@ -3007,7 +3007,7 @@ def build_plugin_parser():
     migrate_adapter.add_argument("--repo", required=True)
     migrate_adapter.add_argument("--mode", required=True, choices=["backup-remove", "restore"])
     migrate_adapter.add_argument("--ditto-home")
-    for name in ("preflight", "prepare"):
+    for name in ("preflight", "freeze", "prepare"):
         command = sub.add_parser(name)
         command.add_argument("--source", choices=["auto", "codex", "claude", "copilot"], default="auto")
         command.add_argument("--path")
@@ -3015,11 +3015,14 @@ def build_plugin_parser():
         command.add_argument("--no-dedupe", action="store_true")
         command.add_argument("--ditto-home")
         mode = command.add_mutually_exclusive_group()
-        mode.add_argument("--stage", choices=sorted(STAGE_CONFIGS), help="EXPERIMENTAL adaptive recall stage")
+        if name != "freeze":
+            mode.add_argument("--stage", choices=sorted(STAGE_CONFIGS), help="EXPERIMENTAL adaptive recall stage")
         mode.add_argument("--preview", action="store_true", help="create a bounded starter profile, not the full profile")
         mode.add_argument("--candidate", type=int, choices=range(len(STARTER_CANDIDATES)), help=argparse.SUPPRESS)
         mode.add_argument("--deep", action="store_true")
         mode.add_argument("--deepen-domain", choices=["work", "design", "write"])
+        if name == "freeze":
+            command.set_defaults(stage=None)
         if name == "prepare":
             command.add_argument("--approved-plan-hash")
     return parser
@@ -3528,16 +3531,19 @@ def plugin_plan_for_args(args, write=False):
     identity = {key: value for key, value in plan.items() if key != "approval_hash"}
     return dict(plan, approval_hash=sha256_text(canonical_json(identity)))
 
-def prepare_plugin_run(args):
+def prepare_plugin_run(args, frozen_plan=None):
     if args.stage is not None:
         return prepare_adaptive_run(args)
     home = resolve_ditto_home(args.ditto_home)
-    approved = plugin_plan_for_args(args, write=False)
-    if args.approved_plan_hash != approved["approval_hash"]:
-        raise ValueError("prepared plan does not match the approved preflight hash; rerun preflight and reapprove")
-    plan = plugin_plan_for_args(args, write=True)
-    if args.approved_plan_hash != plan["approval_hash"]:
-        raise ValueError("source or cache changed after approval; rerun preflight and reapprove")
+    if frozen_plan is None:
+        approved = plugin_plan_for_args(args, write=False)
+        if args.approved_plan_hash != approved["approval_hash"]:
+            raise ValueError("prepared plan does not match the approved preflight hash; rerun preflight and reapprove")
+        plan = plugin_plan_for_args(args, write=True)
+        if args.approved_plan_hash != plan["approval_hash"]:
+            raise ValueError("source or cache changed after approval; rerun preflight and reapprove")
+    else:
+        plan = frozen_plan
     plan_hash = sha256_text(canonical_json(plan))
     timestamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
     base_run_id = f"{timestamp}-{plan_hash[:8]}"
@@ -3591,7 +3597,12 @@ def prepare_plugin_run(args):
         "notice": plan["notice"],
         "candidate_index": plan["candidate_index"],
         "target_domain": args.deepen_domain,
+        "approval_hash": plan["approval_hash"],
+        "valid_sessions": plan["valid_sessions"],
+        "post_dedupe_source_tokens": plan["post_dedupe_source_tokens"],
         "selected_source_tokens": plan["selected_source_tokens"],
+        "cached_segments": plan["cached_segments"],
+        "uncached_segments": plan["uncached_segments"],
         "planned_worker_calls": plan["planned_worker_calls"],
         "planned_reducer_calls": plan["planned_reducer_calls"],
         "selected_segments": selected_with_paths,
@@ -3612,6 +3623,9 @@ def prepare_plugin_run(args):
     )
     atomic_write_text(os.path.join(run_dir, "plan.json"), canonical_json(run_plan) + "\n")
     return run_plan
+
+def freeze_plugin_run(args):
+    return prepare_plugin_run(args, frozen_plan=plugin_plan_for_args(args, write=True))
 
 def plugin_main(argv):
     parser = build_plugin_parser()
@@ -3642,6 +3656,8 @@ def plugin_main(argv):
                 })
         elif args.command == "preflight":
             payload = plugin_plan_for_args(args, write=False)
+        elif args.command == "freeze":
+            payload = freeze_plugin_run(args)
         elif args.command == "prepare":
             payload = prepare_plugin_run(args)
         elif args.command == "validate-report":
